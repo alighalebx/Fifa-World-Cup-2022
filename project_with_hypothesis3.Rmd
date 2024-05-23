@@ -1,0 +1,579 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r}
+
+```
+
+```{r}
+library(ggplot2)
+
+library(caret) # for data preprocessing and model training
+library(randomForest) 
+# For Logistic Regression
+library(glmnet)
+library(nnet)
+library(dplyr)
+
+# For Support Vector Machines
+library(e1071)
+```
+
+```{r}
+data<- read.csv("Fifa_world_cup_matches.csv")
+
+```
+
+```{r}
+
+
+data$total.attempts.team1 <- as.numeric(data$total.attempts.team1)
+data$total.attempts.team2 <- as.numeric(data$total.attempts.team2)
+data$number.of.goals.team1 <- as.numeric(data$number.of.goals.team1)
+data$number.of.goals.team2 <- as.numeric(data$number.of.goals.team2)
+
+all_attempts <- c(data$total.attempts.team1, data$total.attempts.team2)
+all_goals <- c(data$number.of.goals.team1, data$number.of.goals.team2)
+group <- rep(c("Team1", "Team2"), times = c(length(data$total.attempts.team1), length(data$total.attempts.team2)))
+bartlett_test <- bartlett.test(all_attempts, group)
+print(bartlett_test)
+
+if (bartlett_test$p.value > 0.05) {
+  cat("Variance is equal. Performing t-test with equal variances.\n")
+  t_test_result <- t.test(all_attempts, all_goals, var.equal = TRUE)
+} else {
+  cat("Variance is not equal. Performing t-test with unequal variances.\n")
+  t_test_result <- t.test(all_attempts, all_goals, var.equal = FALSE)
+}
+
+print(t_test_result)
+
+if (t_test_result$p.value < 0.05) {
+  cat("There is a statistically significant difference between attempts and goals, suggesting that more attempts might lead to more goals.\n")
+} else {
+  cat("There is no statistically significant difference between attempts and goals, suggesting that more attempts do not necessarily lead to more goals.\n")
+}
+
+
+```
+```{r}
+
+data$possession.team1 <- as.numeric(sub("%", "", data$possession.team1))
+data$possession.team2 <- as.numeric(sub("%", "", data$possession.team2))
+
+data$team_wins <- ifelse(data$number.of.goals.team1 > data$number.of.goals.team2, "Team 1 Wins",
+                         ifelse(data$number.of.goals.team1 < data$number.of.goals.team2, "Team 2 Wins", "Draw"))
+
+data <- data %>%
+  mutate(winning_possession = case_when(
+    team_wins == "Team 1 Wins" ~ possession.team1,
+    team_wins == "Team 2 Wins" ~ possession.team2,
+    TRUE ~ NA  # Exclude draws for the t-test
+  )) %>%
+  mutate(non_winning_possession = case_when(
+    team_wins == "Team 1 Wins" ~ possession.team2,
+    team_wins == "Team 2 Wins" ~ possession.team1,
+    team_wins == "Draw" ~ NA  # Exclude draws for the t-test
+  ))
+
+winning_possession <- na.omit(data$winning_possession)
+non_winning_possession <- na.omit(data$non_winning_possession)
+
+possession <- c(winning_possession, non_winning_possession)
+group <- c(rep("Winning", length(winning_possession)), rep("Non-Winning", length(non_winning_possession)))
+
+bartlett_test <- bartlett.test(possession, group)
+print(bartlett_test)
+
+if (bartlett_test$p.value > 0.05) {  
+  t_test_possession <- t.test(winning_possession, non_winning_possession, var.equal = TRUE)
+} else {
+  t_test_possession <- t.test(winning_possession, non_winning_possession, var.equal = FALSE)
+}
+
+print(t_test_possession)
+print("Based on the analysis, the null hypothesis test indicates that there is no significant difference in possession between winning and non-winning teams.")
+
+
+```
+```{r}
+data$penalty_involved <- with(data, ifelse(penalties.scored.team1 > 0 | penalties.scored.team2 > 0, "With Penalties", "Without Penalties"))
+
+data$penalty_involved <- as.factor(data$penalty_involved)
+
+data$total_goals <- with(data, number.of.goals.team1 + number.of.goals.team2)
+
+t_test_penalties <- t.test(total_goals ~ penalty_involved, data = data, var.equal = TRUE)
+print(t_test_penalties)
+
+print("As we can see we are rejecting the null hypothesis that means that teams with more penalties have more goals scored in the end of the match")
+```
+```{r}
+
+
+data$TotalCards <- rowSums(data[, c('yellow.cards.team1', 'red.cards.team1', 
+                                    'yellow.cards.team2', 'red.cards.team2')], na.rm = TRUE)
+
+data$TotalFouls <- rowSums(data[, c('fouls.against.team1', 'fouls.against.team2')], na.rm = TRUE)
+
+data$AggressionLevel <- cut(data$TotalFouls + data$TotalCards,
+                            breaks = quantile(data$TotalFouls + data$TotalCards, 
+                                              probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                            labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+
+data$AggressionLevel <- as.factor(data$AggressionLevel)
+
+data$total_goals <- with(data, number.of.goals.team1 + number.of.goals.team2)
+
+anova_results <- aov(total_goals ~ AggressionLevel, data = data)
+summary_anova <- summary(anova_results)
+
+print(summary_anova)
+
+print("The physical aggression does not influence the average goals per match ")
+
+   
+
+```
+
+```{r}
+# Function to Combine Teams
+combining_teams <- function(col1, col2) {
+  # Combine two columns into one dataframe
+  team.stat <- rbind(
+    data.frame(team = data$team1, total = col1),
+    data.frame(team = data$team2, total = col2)
+  )
+  # Aggregate the total for each team
+  aggregate(total ~ team, data = team.stat, sum)
+}
+
+
+```
+
+
+```{r}
+# Function to Calculate Top N Teams
+calculate_top_n_teams <- function(data, col, n) {
+  # Order data and select top N teams
+  data[order(data[[col]], decreasing = TRUE), ][1:n, ]
+}
+```
+
+
+```{r}
+# Function to Combine Attempts and Goals Data
+combine_attempts_goals <- function(attempts_col1, attempts_col2, goals_data) {
+  # Combine attempts data and goals data for each team
+  team.attempts <- combining_teams(attempts_col1, attempts_col2)
+  team.goals.attempts <- merge(team.attempts, goals_data, by = "team")
+  # Rename columns for clarity
+  colnames(team.goals.attempts) <- c("team", "total.attempts", "total.goals")
+  # Order teams by total goals
+  team.goals.attempts <- team.goals.attempts[order(team.goals.attempts$total.goals, decreasing = TRUE), ]
+  team.goals.attempts
+}
+```
+
+
+```{r}
+# Define Teams for Different Stages
+round_of_16 <- c("Netherlands", "Senegal", "England", "USA", "Argentina", "Poland", "France", "Australia", 
+                 "Japan", "Spain", "Morocco", "Croatia", "Brazil", "Switzerland", "Portugal", "South Korea")
+quarter_finals <- c("Netherlands", "England", "Argentina", "France", "Spain", "Brazil", "Portugal", "Croatia")
+semi_finals <- c("Croatia", "Argentina", "Morocco", "France")
+final <- c("Argentina", "France")
+```
+
+
+```{r}
+# Create Qualification Dataframe
+all_teams <- unique(c(round_of_16, quarter_finals, semi_finals, final))
+qualification <- data.frame(
+  team = all_teams,
+  stage_reached = NA_character_
+)
+
+# Assign stages reached to teams
+qualification$stage_reached[qualification$team %in% round_of_16] <- "Round of 16"
+qualification$stage_reached[qualification$team %in% quarter_finals] <- "Quarter-finals"
+qualification$stage_reached[qualification$team %in% semi_finals] <- "Semi-finals"
+qualification$stage_reached[qualification$team %in% final] <- "Final"
+
+qualification$stage_reached[is.na(qualification$stage_reached)] <- "Did not qualify to R16"
+qualification$team <- toupper(qualification$team)
+```
+
+
+```{r}
+# Calculate Team Goals
+team_goals <- combining_teams(data$number.of.goals.team1, data$number.of.goals.team2)
+top_10_teams_goals <- calculate_top_n_teams(team_goals, "total", 10)
+
+# Calculate Possession Data
+data$possession.team1 <- as.numeric(sub("%", "", data$possession.team1))
+data$possession.team2 <- as.numeric(sub("%", "", data$possession.team2))
+possession_by_team <- combining_teams(data$possession.team1, data$possession.team2)
+possession_by_team$average_possession <- possession_by_team$total / table(c(data$team1, data$team2))[possession_by_team$team]
+top_10_teams_pos <- calculate_top_n_teams(possession_by_team, "total", 10)
+
+# Calculate Team Attempts and Goals
+team_goals_attempts <- combine_attempts_goals(data$total.attempts.team1, data$total.attempts.team2, team_goals)
+```
+
+```{r}
+# Merge Dataframes
+combined_data <- merge(team_goals_attempts, qualification, by = "team", all.x = TRUE)
+combined_data$stage_reached[is.na(combined_data$stage_reached)] <- "Did not qualify to R16"
+
+
+team_goals_attempts$goals.per.attempts <- team_goals_attempts$total.attempts / team_goals_attempts$total.goals
+top_10_conv <- head(team_goals_attempts[order(team_goals_attempts$goals.per.attempts, decreasing = TRUE), ], 10)
+
+
+combined_data <- merge(combined_data, possession_by_team, by = "team")
+
+
+conceding.data <- combining_teams(data$conceded.team1, data$conceded.team2)
+combined_data <- merge(combined_data, conceding.data, by = "team")
+colnames(combined_data)[colnames(combined_data) == "total.y"] <- "total.conceded"
+combined_data$total.x <- NULL
+top_10_conceded <- calculate_top_n_teams(combined_data, "total.conceded", 10)
+
+
+total.passes<-combining_teams(data$passes.team1,data$passes.team2)
+combined_data<-merge(combined_data,total.passes,by.x="team",by.y = "team")
+colnames(combined_data)[colnames(combined_data) == "total"] <- "total.passes"
+
+
+passes.completed<-combining_teams(data$passes.completed.team1,data$passes.completed.team2)
+combined_data<-merge(combined_data,passes.completed,by.x="team",by.y = "team")
+colnames(combined_data)[colnames(combined_data)=="total"]<-"passes.completed"
+combined_data$pass.accuracy<-(combined_data$passes.completed/combined_data$total.passes)*100
+
+
+yellow.cards<-combining_teams(data$yellow.cards.team1,data$yellow.cards.team2)
+combined_data<-merge(combined_data,yellow.cards,by.x="team",by.y = "team")
+colnames(combined_data)[colnames(combined_data)=="total"]<-"yellow.cards"
+
+
+red.cards<-combining_teams(data$red.cards.team1,data$red.cards.team2)
+combined_data<-merge(combined_data,red.cards,by.x="team",by.y = "team")
+colnames(combined_data)[colnames(combined_data)=="total"]<-"red.cards"
+
+
+team_regions <- data.frame(
+  team = c("ARGENTINA", "AUSTRALIA", "BELGIUM", "BRAZIL", "CAMEROON", "CANADA", "COSTA RICA", "CROATIA", "DENMARK", "ECUADOR", 
+           "ENGLAND", "FRANCE", "GERMANY", "GHANA", "IRAN", "JAPAN", "KOREA REPUBLIC", "MEXICO", "MOROCCO", "NETHERLANDS", 
+           "POLAND", "PORTUGAL", "QATAR", "SAUDI ARABIA", "SENEGAL", "SERBIA", "SPAIN", "SWITZERLAND", "TUNISIA", "UNITED STATES", 
+           "URUGUAY", "WALES"),
+  region = c("South America", "Oceania", "Europe", "South America", "Africa", "North America", "North America", "Europe", "Europe", "South America", 
+             "Europe", "Europe", "Europe", "Africa", "Asia", "Asia", "Asia", "North America", "Africa", "Europe", "Europe", "Europe", 
+             "Asia", "Asia", "Africa", "Europe", "Europe", "Europe", "Africa", "North America", "South America", "Europe")
+)
+
+combined_data <- merge(combined_data, team_regions, by = "team")
+continent_counts <- table(combined_data$region)
+percentages <- round(100 * continent_counts / sum(continent_counts), 1)
+
+
+goal.preventions<-combining_teams(data$goal.preventions.team1,data$goal.preventions.team2)
+combined_data<-merge(combined_data,goal.preventions,by.x = "team",by.y="team")
+colnames(combined_data)[colnames(combined_data)=="total"]<-"goal.preventions"
+
+
+
+combined_data$goal_prevention_ratio <- combined_data$goal.preventions / combined_data$total.conceded
+pie_data <- data.frame(Continent = names(continent_counts), Percentage = percentages)
+
+```
+
+
+```{r}
+# Top 10 Scoring Teams
+ggplot(data = top_10_teams_goals, aes(x = reorder(team, total), y = total)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Team", y = "Total Goals", title = "Top 10 Scoring Teams") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+
+```{r}
+# Top 10 Teams (Average Possession)
+ggplot(data = top_10_teams_pos, aes(x = reorder(team, average_possession), y = average_possession)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Team", y = "Possession %", title = "Top 10 Teams (Average Possession)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Total Attempts vs. Total Goals
+ggplot(data = combined_data, aes(x = total.attempts, y = total.goals)) +
+  geom_jitter(aes(color = stage_reached)) +
+  geom_boxplot(alpha = 0.5, outlier.colour = NA,fill="maroon") +
+  labs(x = "Total Attempts", y = "Total Goals", title = "Total Attempts vs. Total Goals", color = "Stage Reached") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Conversion Rate
+ggplot(data = team_goals_attempts, aes(x = reorder(team, goals.per.attempts), y = goals.per.attempts)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Team", y = "Goals/Attempts", title = "Conversion Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Total Goals vs. Average Possession
+ggplot(data=combined_data,aes(x=average_possession,y=total.goals))+
+  geom_point(aes(color=stage_reached))+
+  labs(x = "Average Possession", y = "Total Goals", title = "Total Goals vs. Average Possession", color = "Stage Reached") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust=0.5))
+
+```
+```{r}
+# Histogram/Density Plot of Average Possession
+ggplot(data = combined_data, aes(x = average_possession)) +
+  geom_histogram(aes(y = ..density..), fill = "maroon", color = "gold", bins = 10) +
+  geom_density(fill = "gold", alpha = 0.3) +
+  labs(x = "Average Possession", title = "Histogram/Density Plot of Average Possession") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Top 10 Goals Conceded
+ggplot(data = top_10_conceded, aes(x = reorder(team, total.conceded), y = total.conceded)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Team", y = "Goals Conceded", title = "Top 10 Goals Conceded") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Total Passes By Team
+ggplot(data = combined_data, aes(x = reorder(team, total.passes), y = total.passes)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Teams", y = "Total Passes", title = "Total Passes By Team") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Pass Accuracy By Team
+ggplot(data = combined_data, aes(x = reorder(team, pass.accuracy), y = pass.accuracy)) +
+  geom_col(fill = "maroon", color = "gold") +
+  coord_cartesian(ylim = c(70,100)) +
+  labs(x = "Teams", y = "Pass Accuracy %", title = "Pass Accuracy By Team") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Passes Completed vs. Average Possession
+ggplot(data = combined_data, aes(x = passes.completed, y = average_possession)) +
+  geom_point(color = "orange") +
+  geom_boxplot(fill = "maroon", alpha = 0.4, outlier.colour = "black") +
+  labs(x = "Passes Completed", y = "Average Possession", title = "Passes Completed vs. Average Possession") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_text(hjust = 0.5, vjust = -0.5))
+```
+
+
+```{r}
+# Passes Completed vs. Total Goals
+ggplot(data = combined_data, aes(x = passes.completed, y = total.goals)) +
+  geom_point(color = "orange") +
+  geom_boxplot(fill = "maroon", alpha = 0.4, outlier.colour = "black") +
+  labs(x = "Passes Completed", y = "Total Goals", title = "Passes Completed vs. Total Goals") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_text(hjust = 0.5, vjust = -0.5))
+```
+
+```{r}
+# Histogram/Density (Passes Completed)
+ggplot(data = combined_data, aes(x = passes.completed)) +
+  geom_histogram(aes(y = ..density..), fill = "maroon", color = "gold", bins = 10) +
+  geom_density(fill = "gold", alpha = 0.3) +
+  labs(x = "Passes Completed", title = "Histogram/Density (Passes Completed)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Red and Yellow Cards by Team
+ggplot(combined_data, aes(x = reorder(team, yellow.cards + red.cards), y = yellow.cards + red.cards, fill = factor(red.cards))) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_fill_manual(values = c("gold", "maroon"), name = "Red Cards") +
+  labs(x = "Team", y = "Number of Cards", title = "Red and Yellow Cards by Team") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5)) +
+  coord_flip()
+
+```
+
+
+```{r}
+# Participation by Continent
+colors <- c("#800000", "#9c1125", "#c02147", "#f5c24a", "#eaa021", "#d89000")
+ggplot(pie_data, aes(x = "", y = Percentage.Freq, fill = Continent)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  labs(title = "Participation by Continent") +
+  scale_fill_manual(values = colors) +  
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(label = paste0(Percentage.Freq, "%")), 
+            position = position_stack(vjust = 0.5),
+            color = "white")
+```
+
+```{r}
+# Goal Prevention Rate
+ggplot(data = combined_data, aes(x = reorder(team, goal_prevention_ratio), y = goal_prevention_ratio)) +
+  geom_col(fill = "maroon", color = "gold") +
+  labs(x = "Team", y = "Goals/Attempts", title = "Goal Prevention Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.9),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+# Load required libraries
+library(dplyr)
+
+# Calculate average goals for each team
+avg_goals_team1 <- mean(data$number.of.goals.team1)
+avg_goals_team2 <- mean(data$number.of.goals.team2)
+
+# Perform t-tests
+# Student's t-test
+t_test_student <- t.test(data$number.of.goals.team1, data$number.of.goals.team2)
+
+# Welch's t-test
+t_test_welch <- t.test(data$number.of.goals.team1, data$number.of.goals.team2, var.equal = FALSE)
+
+# Perform ANOVA
+anova_result <- aov(number.of.goals.team1 ~ number.of.goals.team2, data = data)
+
+# Summarize results
+cat("Average goals for Team 1:", avg_goals_team1, "\n")
+cat("Average goals for Team 2:", avg_goals_team2, "\n\n")
+
+cat("Student's t-test result:\n")
+print(t_test_student)
+
+cat("\nWelch's t-test result:\n")
+print(t_test_welch)
+
+cat("\nANOVA result:\n")
+print(summary(anova_result))
+
+```
+
+
+```{r}
+
+# Remove '%' symbol and convert to numeric
+data$Winner <- ifelse(data$number.of.goals.team1 > data$number.of.goals.team2, 1,
+                    ifelse(data$number.of.goals.team1 < data$number.of.goals.team2, 2, 0))
+
+```
+```{r}
+
+```
+
+```{r}
+selected_features <- c( "total.attempts.team1", "total.attempts.team2",
+                       "on.target.attempts.team1", "on.target.attempts.team2", "off.target.attempts.team1", 
+                       "off.target.attempts.team2", "assists.team1", "assists.team2", "goal.preventions.team1",
+                       "goal.preventions.team2", "passes.team1", "passes.team2", "crosses.team1", "crosses.team2",
+                       "defensive.pressures.applied.team1","defensive.pressures.applied.team2","penalty_involved", "Winner")
+
+# Create a subset with selected features
+data_subset <- data[selected_features]
+
+# Convert possession to numeric
+#data_subset$possession.team1 <- as.numeric(sub("%", "", data_subset$possession.team1))/100
+#data_subset$possession.team2 <- as.numeric(sub("%", "", data_subset$possession.team2))/100
+
+```
+
+```{r}
+# Split data into training and testing sets
+set.seed(123) # for reproducibility
+train_index <- createDataPartition(data_subset$Winner, p = 0.8, list = FALSE)
+train_data <- data_subset[train_index, ]
+test_data <- data_subset[-train_index, ]
+
+train_data$Winner <- factor(train_data$Winner, levels = c(0, 1, 2))
+test_data$Winner <- factor(test_data$Winner, levels = c(0, 1, 2))
+
+# Train a random forest classifier
+model <- train(Winner ~ ., data = train_data, method = "rf")
+
+# Predict on test data
+predictions <- predict(model, newdata = test_data)
+
+# Evaluate the model
+confusionMatrix(predictions, test_data$Winner)
+
+```
+```{r}
+# Train logistic regression model using one-vs-all approach
+log_model <- train(Winner ~ ., data = train_data, method = "multinom", trControl = trainControl(method = "repeatedcv", number = 10, repeats = 3))
+
+# Predict on test data
+log_predictions <- predict(log_model, newdata = test_data)
+
+# Evaluate the logistic regression model
+confusionMatrix(log_predictions, test_data$Winner)
+
+
+```
+```{r}
+# Train SVM model
+svm_model <- train(Winner ~ ., data = train_data, method = "svmLinear")
+
+# Predict on test data
+svm_predictions <- predict(svm_model, newdata = test_data)
+
+# Evaluate the SVM model
+confusionMatrix(svm_predictions, test_data$Winner)
+1
+```
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
